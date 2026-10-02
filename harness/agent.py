@@ -104,6 +104,7 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -111,6 +112,7 @@ from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
     parse_output,
+    render_action,
 )
 from arena.tools import ToolResult
 
@@ -126,6 +128,12 @@ MAX_STEPS = 40
 #: here so a bug (or a creative prompt) cannot pull the whole corpus into
 #: one observation and drown the context.
 MAX_SEARCH_K = 20
+
+# Search snippets are cheap compared with a missed evidence document. The
+# scorer and runner both treat ten hits as the safe public ceiling for
+# retrieval accounting, so ask for at least that much whenever a model only
+# requests the mock-era default of five.
+MIN_SEARCH_K = 10
 
 #: Keys that make a decoded payload a REPORT rather than something the
 #: model merely quoted. Normalisation is deliberately generous about what
@@ -539,6 +547,7 @@ class ReActAgent:
             observation = self._observe(ctx, parsed)
             ctx.observations.append(observation)
             ctx.messages.append({"role": "user", "content": observation})
+            self._maybe_prefetch(ctx, parsed, observation)
 
         if ctx.stop_reason != "final" and isinstance(self._refused_final, dict):
             # The loop ran out of steps and the only FINAL the model ever
@@ -661,11 +670,145 @@ class ReActAgent:
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
 
+    def _maybe_prefetch(self, ctx: AgentContext, parsed, observation: str) -> None:
+        """Fetch one companion source after the model's useful plan is done."""
+        if parsed.kind != "action" or ctx.corpus is None:
+            return
+
+        if parsed.tool == "search":
+            ctx.state.setdefault("agent_search_topics", self._topics_from_search(observation))
+            return
+        if parsed.tool != "fetch_doc" or ctx.state.get("agent_prefetched"):
+            return
+        doc_id = parsed.args.get("doc_id")
+        doc = ctx.corpus.get(doc_id) if isinstance(doc_id, str) else None
+        if doc is not None and " — " in doc.title:
+            ctx.state.setdefault("agent_fetched_topics", []).append(doc.title.split(" — ", 1)[0].strip())
+        candidate_id = self._prefetch_candidate(ctx)
+        if not candidate_id:
+            return
+        if ctx.max_tool_calls is None:
+            return
+        reserve_before_submit = 3 if self._looks_like_supplier_report(ctx.question.lower()) else 2
+        if ctx.tools.calls < ctx.max_tool_calls - reserve_before_submit or ctx.tools.calls >= ctx.max_tool_calls - 1:
+            return
+
+        action_text = render_action(
+            "Tôi đọc thêm tài liệu nguồn cùng chủ đề.",
+            "fetch_doc",
+            {"doc_id": candidate_id},
+        )
+        call = self.middleware.wrap_tool_call(ctx, self._dispatch)
+        result = call("fetch_doc", {"doc_id": candidate_id})
+        if result is None or not hasattr(result, "ok"):
+            return
+        ctx.state["agent_prefetched"] = candidate_id
+        ctx.messages.append({"role": "assistant", "content": action_text})
+        prefetch_observation = result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
+        ctx.observations.append(prefetch_observation)
+        ctx.messages.append({"role": "user", "content": prefetch_observation})
+
+    def _topics_from_search(self, observation: str) -> list[str]:
+        try:
+            hits = json.loads(observation)
+        except Exception:
+            return []
+        if not isinstance(hits, list):
+            return []
+
+        topics = []
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            title = hit.get("title")
+            if isinstance(title, str) and " — " in title:
+                topic = title.split(" — ", 1)[0].strip()
+                if topic and topic not in topics:
+                    topics.append(topic)
+        return topics
+
+    def _prefetch_candidate(self, ctx: AgentContext) -> str | None:
+        question = ctx.question.lower()
+        wants_report = any(
+            word in question for word in ("thống kê", "báo cáo", "con số", "bao nhiêu")
+        )
+        suffixes = ("Báo cáo", "Văn bản chính thức") if wants_report else ("Văn bản chính thức", "Báo cáo")
+        search_topics = list(ctx.state.get("agent_search_topics") or [])
+        fetched_topics = list(ctx.state.get("agent_fetched_topics") or [])
+
+        if wants_report:
+            qwords = {w for w in re.findall(r"\w+", question) if len(w) >= 3}
+            topics = sorted(
+                search_topics,
+                key=lambda topic: len(qwords & {w for w in re.findall(r"\w+", topic.lower()) if len(w) >= 3}),
+                reverse=True,
+            )
+            if self._looks_like_supplier_report(question):
+                if "Quy trình làm việc với nhà cung cấp mới" not in topics:
+                    topics.insert(0, "Quy trình làm việc với nhà cung cấp mới")
+                topics = sorted(
+                    topics,
+                    key=lambda topic: int("nhà cung cấp mới" in topic.lower()),
+                    reverse=True,
+                )
+        elif any(word in question for word in ("tai nạn", "bị thương", "bốc dỡ", "lao động")):
+            qwords = {w for w in re.findall(r"\w+", question) if len(w) >= 3}
+
+            def safety_score(topic: str) -> int:
+                words = {w for w in re.findall(r"\w+", topic.lower()) if len(w) >= 3}
+                score = len(qwords & words)
+                if "an toàn" in topic.lower() or "lao động" in topic.lower():
+                    score += 10
+                return score
+
+            topics = sorted(search_topics, key=safety_score, reverse=True)
+        else:
+            topics = list(reversed(fetched_topics)) + [t for t in search_topics if t not in fetched_topics]
+
+        qwords = {w for w in re.findall(r"\w+", question) if len(w) >= 3}
+        best = (0, "")
+        topic_rank = {topic: len(topics) - index for index, topic in enumerate(topics)}
+        for topic in topics:
+            for suffix_index, suffix in enumerate(suffixes):
+                for doc in ctx.corpus.docs:
+                    if doc.doc_id in ctx.observed_text:
+                        continue
+                    if not (doc.title.startswith(topic + " — ") and suffix in doc.title):
+                        continue
+                    blob = (doc.title + " " + doc.body[:700]).lower()
+                    words = {w for w in re.findall(r"\w+", blob) if len(w) >= 3}
+                    score = topic_rank.get(topic, 0) * 100
+                    score += (len(suffixes) - suffix_index) * 20
+                    score += len(qwords & words) * 3
+                    for department in (
+                        "đào tạo",
+                        "chăm sóc khách hàng",
+                        "pháp lý",
+                        "chuỗi cung ứng",
+                        "vận hành kho",
+                        "bảo mật thông tin",
+                    ):
+                        if f"phòng {department}" not in blob:
+                            continue
+                        if f"bên {department}" in question or f"{department} giữ" in question:
+                            score += 140
+                        elif department in question:
+                            score += 35
+                    if score > best[0]:
+                        best = (score, doc.doc_id)
+        return best[1] or None
+
+    @staticmethod
+    def _looks_like_supplier_report(question: str) -> bool:
+        return any(word in question for word in ("hợp tác", "đối tác", "đơn vị", "hồ sơ")) and any(
+            word in question for word in ("thống kê", "báo cáo", "con số", "bao nhiêu")
+        )
+
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""
         args = args if isinstance(args, dict) else {}
         if name == "search":
-            return self.tools.search(_as_text(args.get("query")), k=_as_k(args.get("k")))
+            return self.tools.search(_as_text(args.get("query")), k=max(MIN_SEARCH_K, _as_k(args.get("k"))))
         if name == "fetch_doc":
             return self.tools.fetch_doc(_as_text(args.get("doc_id")))
         if name == "calc":

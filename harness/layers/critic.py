@@ -92,3 +92,53 @@ class Critic(Middleware):
         #     không đủ căn cứ.
         #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
         return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+def _critic_after_agent(self, ctx, report):
+    claims = report.get("claims")
+    if not isinstance(claims, list):
+        return report
+
+    def source_doc_id(text):
+        for doc in getattr(ctx.corpus, "docs", []):
+            if text in ctx.observed_text and text in doc.body and (
+                doc.body in ctx.observed_text or doc.doc_id in ctx.observed_text
+            ):
+                return doc.doc_id
+        return None
+
+    kept = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        text = claim.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        if ctx.saw(text):
+            kept.append(claim)
+            continue
+
+        split_claims = []
+        for glue in (" và ", " nhưng ", " song ", " còn "):
+            if glue not in text:
+                continue
+            left, right = text.split(glue, 1)
+            left_id, right_id = source_doc_id(left), source_doc_id(right)
+            if left_id and right_id and left_id != right_id:
+                split_claims = [
+                    {"text": left, "doc_id": left_id},
+                    {"text": right, "doc_id": right_id},
+                ]
+                break
+        if split_claims:
+            kept.extend(split_claims)
+            report["abstain"] = True
+
+    report["claims"] = kept
+    report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+    if not kept:
+        report["abstain"] = True
+        report["citations"] = []
+        report["answer"] = "Khong du can cu trong cac tai lieu da quan sat de ket luan."
+    return report
+
+
+Critic.after_agent = _critic_after_agent
